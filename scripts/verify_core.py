@@ -528,6 +528,72 @@ def main() -> int:
     assert r["slots"] == [] and r["earliest_start_at"] is None
     print("case 13 maintenance-slot queries OK")
 
+    # --- Case 14: dependency cancel cascade -------------------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    t = submit("a", 8, 10, 1.0, iso(0))                    # J000001
+    x = scheduler.submit_job("b", 1, 10, 1.0, depends_on=[t["id"]])
+    y = scheduler.submit_job("c", 1, 10, 1.0, depends_on=[x["id"]])
+    z = scheduler.submit_job(
+        "b", 1, 10, 1.0, depends_on=[t["id"], y["id"]])
+
+    # Preview: transitive closure, id-sorted, one shortest chain each.
+    impact = scheduler.cancel_impact(t["id"])
+    assert impact["affected_count"] == 3
+    assert [j["id"] for j in impact["affected_jobs"]] == [
+        x["id"], y["id"], z["id"]]
+    chains = {j["id"]: j["chain"] for j in impact["affected_jobs"]}
+    assert chains[x["id"]] == [t["id"], x["id"]]
+    assert chains[y["id"]] == [t["id"], x["id"], y["id"]]
+    assert chains[z["id"]] == [t["id"], z["id"]]  # direct edge is shortest
+    # The preview writes nothing.
+    assert all(
+        scheduler.get_job(j)["status"] == "QUEUED"
+        for j in [t["id"], x["id"], y["id"], z["id"]]
+    )
+
+    # Dispatch the target, then cascade: the RUNNING occupancy is released
+    # and every still-QUEUED descendant is cancelled atomically.
+    r = scheduler.run_batch(now=at(1))
+    assert r["selection_order"] == [t["id"]]
+    assert scheduler.scheduler_state()["used_gpus"] == 8
+    res = scheduler.cancel_cascade(t["id"])
+    assert res["cancelled"] == [t["id"], x["id"], y["id"], z["id"]]
+    assert scheduler.scheduler_state()["used_gpus"] == 0
+    assert scheduler.queue_overview()["queued_jobs"] == 0
+
+    # Already-cancelled intermediate nodes are traversal-only: the closure
+    # passes through them but the cascade never re-modifies them.
+    db.reset_for_tests()
+    db.connect(":memory:")
+    a = submit("a", 1, 10, 1.0, iso(0))
+    b = scheduler.submit_job("b", 1, 10, 1.0, depends_on=[a["id"]])
+    c = scheduler.submit_job("c", 1, 10, 1.0, depends_on=[b["id"]])
+    scheduler.cancel_job(b["id"])
+    b_cancelled_at = scheduler.get_job(b["id"])["completed_at"]
+    impact = scheduler.cancel_impact(a["id"])
+    assert [j["id"] for j in impact["affected_jobs"]] == [c["id"]]
+    assert impact["affected_jobs"][0]["chain"] == [a["id"], b["id"], c["id"]]
+    res = scheduler.cancel_cascade(a["id"])
+    assert res["cancelled"] == [a["id"], c["id"]]
+    assert scheduler.get_job(b["id"])["completed_at"] == b_cancelled_at
+
+    # 404/409 admissibility on both endpoints.
+    for fn in (scheduler.cancel_impact, scheduler.cancel_cascade):
+        try:
+            fn("J000999")
+        except scheduler.NotFound:
+            pass
+        else:
+            raise AssertionError("unknown target should 404")
+        try:
+            fn(a["id"])  # already CANCELLED by the cascade above
+        except scheduler.Conflict:
+            pass
+        else:
+            raise AssertionError("cancelled target should 409")
+    print("case 14 dependency cancel cascade OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 

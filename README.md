@@ -192,6 +192,29 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
 - 修订**不改写首次提交的幂等指纹**：用原 `Idempotency-Key` + 原参数重试
   `POST /jobs` 只会返回（可能已修订的）作业当前对象，不会把依赖改回提交时的样子。
 
+### 依赖取消级联清理（`cancel-impact` / `cancel-cascade`）
+
+取消一个作业后，所有（传递）依赖它的排队作业将永远等不到前置完成。本模块沿
+**跨租户依赖图**求传递闭包，预览并清理这些“永久受阻”的排队后代：
+
+- **闭包遍历规则**：从目标作业出发沿「前置 → 依赖者」方向广度优先遍历；
+  **穿过已取消（CANCELLED）节点**——已取消的前置永远不可能完成，阻塞会透过它
+  继续传播；**不穿过已完成（COMPLETED）节点**——已满足的前置不阻塞任何人，
+  闭包到此为止。
+- `GET /jobs/{id}/cancel-impact`（**纯预览，不写库**）：返回目标作业信息及
+  **按作业 id 排序**的受影响 QUEUED 作业列表，每个作业附带**一条最短依赖链**
+  （从目标到该作业，链上每个作业依赖前一个；等长时取 id 升序 BFS 首先到达者，
+  结果确定）。
+- `POST /jobs/{id}/cancel-cascade`（**执行清理**）：在与现有取消、依赖修订
+  **共用的进程写锁与 `BEGIN IMMEDIATE` 写事务**内**重新计算**影响范围，原子地
+  取消目标及范围内仍为 QUEUED 的全部作业；目标若为 RUNNING，其占用的 GPU
+  （含租户 `max_gpus` 额度）立即释放给后续批次。**已取消的中间节点只用于遍历，
+  不会被重复修改**（其 `completed_at` 等保持不变）；队列排空的租户老化时钟随之
+  重置，与单个取消一致。
+- 两个接口对目标的校验一致：不存在 → 404；已完成或已取消 → 409。
+- 执行后现有作业与队列接口（`GET /jobs`、`GET /queue`、批次调度等）立即反映
+  结果：被级联取消的作业为 `CANCELLED`，不再参与调度。
+
 ### GPU 维护时段（`maintenance_windows`，持久化）
 
 可创建**持久化的 GPU 维护时段**：每段是一个 **UTC 半开区间 `[start_at, end_at)`**，
@@ -518,6 +541,55 @@ curl -X POST http://localhost:8000/jobs/J000002/cancel     # QUEUED/RUNNING -> C
 
 - 只有 RUNNING 可 complete（否则 409）；已结束作业重复取消 409；不存在 404。
 
+### 3b. 依赖取消级联：预览 `GET /jobs/{id}/cancel-impact`，执行 `POST /jobs/{id}/cancel-cascade`
+
+预览取消某个 **QUEUED 或 RUNNING** 作业后会**永久受阻的排队后代**（沿跨租户
+依赖图求传递闭包，穿过已取消节点、不穿过已完成节点；**纯读取，不写库**）：
+
+```bash
+# J000002 依赖 J000001，J000003 依赖 J000002（可跨租户）
+curl http://localhost:8000/jobs/J000001/cancel-impact
+```
+
+```jsonc
+{
+  "job_id": "J000001",
+  "status": "QUEUED",
+  "affected_count": 2,
+  "affected_jobs": [
+    {"id": "J000002", "tenant_id": "team-b", "status": "QUEUED",
+     "depends_on": ["J000001"], "chain": ["J000001", "J000002"], ...},
+    {"id": "J000003", "tenant_id": "team-c", "status": "QUEUED",
+     "depends_on": ["J000002"], "chain": ["J000001", "J000002", "J000003"], ...}
+  ]
+}
+```
+
+- `affected_jobs` **按作业 id 排序**，每个元素是完整作业对象并附带 `chain`：
+  从目标到该作业的**一条最短依赖链**（链上每个作业依赖前一个）。
+
+确认影响范围后执行级联取消（与现有取消、依赖修订共用同一写锁与 SQLite 写
+事务，在执行事务内**重新计算**影响范围）：
+
+```bash
+curl -X POST http://localhost:8000/jobs/J000001/cancel-cascade
+```
+
+```jsonc
+{
+  "job_id": "J000001",
+  "cancelled_count": 3,
+  "cancelled": ["J000001", "J000002", "J000003"],
+  "jobs": [ {"id": "J000001", "status": "CANCELLED", ...}, ... ]
+}
+```
+
+- 目标及范围内仍为 QUEUED 的作业被原子取消；目标若为 RUNNING，其 GPU 占用
+  立即释放给后续批次；**已取消的中间节点只用于遍历，不被重复修改**。
+- 目标不存在 → 404；目标已完成或已取消 → 409（预览接口同样）。
+- 执行后 `GET /jobs`、`GET /queue` 等接口立即反映：被清理的作业为
+  `CANCELLED`，不再出现在队列中。
+
 ### 4. 查询队列 / 作业 / 租户 / 流水
 
 ```bash
@@ -720,6 +792,8 @@ curl -s -G localhost:8000/jobs/J000001/maintenance-slots \
 | GET | `/jobs/{id}` | 作业详情 |
 | PATCH | `/jobs/{id}/dependencies` | **整体替换 QUEUED 作业的前置依赖**（去重排序、空数组解除、跨租户允许；未知 id/自依赖/成环 → 400 且原依赖不变，非 QUEUED → 409）；下一次预演/批次按新依赖判断 |
 | POST | `/jobs/{id}/cancel` | 取消作业 |
+| GET | `/jobs/{id}/cancel-impact` | **取消影响预览（零写入）**：沿跨租户依赖图求传递闭包（穿过已取消节点、不穿过已完成节点），按作业 id 排序返回取消该 QUEUED/RUNNING 作业后会永久受阻的排队后代及各自一条最短依赖链；不存在 404、已完成/已取消 409 |
+| POST | `/jobs/{id}/cancel-cascade` | **依赖取消级联清理（落库）**：与取消/依赖修订共用写锁与写事务，事务内重算影响范围，原子取消目标及范围内仍为 QUEUED 的作业并释放目标运行占用；已取消中间节点仅遍历不重复修改；404/409 同上 |
 | POST | `/jobs/{id}/complete` | 完成运行中作业并释放 GPU |
 | GET | `/jobs/{id}/maintenance-slots` | **QUEUED 作业维护空档查询**：以当前 RUNNING 占用为固定基线，叠加已保存维护时段，返回 `[start, end)` 内可行的预计开始时刻区间（含两端包含标记与孤立时刻）及最早时刻；非 QUEUED → 409，无空档返回空列表 |
 | POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限，可选 `budget_gpu_min` 设置/更新/清除滚动 24h GPU-分钟预算（省略保留、null 清除） |
@@ -761,6 +835,10 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
   -d '{"tenant_id":"dave","gpus":2,"duration_min":15,"depends_on":["J000003"]}'
 curl -s -X POST localhost:8000/scheduler/batch        # => []（J000003 仍 RUNNING，dave 不消耗量子）
 curl -s localhost:8000/jobs/J000004                   # blocked_by 标明 J000003/RUNNING
+
+# 取消影响预览（零写入）：若取消 J000003，哪些排队后代会永久受阻
+curl -s localhost:8000/jobs/J000003/cancel-impact
+# {"affected_count":1,"affected_jobs":[{"id":"J000004","chain":["J000003","J000004"],...}],...}
 
 # 依赖修订（仅 QUEUED）：改为等 J000002，或传 [] 直接解除全部依赖；
 # 下一次预演/批次即按新依赖判断
@@ -812,6 +890,16 @@ curl -s -X POST localhost:8000/maintenance-windows -H 'Content-Type: application
 curl -s localhost:8000/maintenance-windows
 curl -s -G localhost:8000/maintenance-windows \
   --data-urlencode "active_at=2026-09-24T03:00:00Z"
+
+# 依赖取消级联（执行）：J000010 依赖 J000009；一个调用原子取消目标及其
+# 仍为 QUEUED 的全部受阻后代（已取消的中间节点只用于遍历，不被重复修改）
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"eve","gpus":2,"duration_min":30}'
+curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"tenant_id":"frank","gpus":1,"duration_min":10,"depends_on":["J000009"]}'
+curl -s -X POST localhost:8000/jobs/J000009/cancel-cascade
+# {"cancelled_count":2,"cancelled":["J000009","J000010"],...}
+curl -s localhost:8000/jobs/J000010                   # status: CANCELLED
 ```
 
 ---
@@ -822,7 +910,7 @@ curl -s -G localhost:8000/maintenance-windows \
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（153 个：服务层算法/依赖/依赖修订/用量汇总/租户 GPU 上限/
+# 运行全部测试（173 个：服务层算法/依赖/依赖修订/依赖取消级联/用量汇总/租户 GPU 上限/
 # 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段/维护空档查询/POST /jobs 幂等提交 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
@@ -839,8 +927,8 @@ CLUSTER_GPUS=8 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 app/
   config.py       # 环境变量配置
   db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger/job_dependencies/idempotent_jobs/maintenance_windows，含旧库补列迁移）
-  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段/空档查询 + 租户上限/24h 预算准入 + 依赖修订 + 幂等提交，框架无关）
-  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头；PATCH /jobs/{id}/dependencies；GET /jobs/{id}/maintenance-slots）
+  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段/空档查询 + 租户上限/24h 预算准入 + 依赖修订 + 依赖取消级联 + 幂等提交，框架无关）
+  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头；PATCH /jobs/{id}/dependencies；GET /jobs/{id}/maintenance-slots；GET /jobs/{id}/cancel-impact 与 POST /jobs/{id}/cancel-cascade）
 scripts/
   verify_core.py  # 零依赖核心算法验证
 tests/
@@ -851,6 +939,7 @@ tests/
   test_maintenance_slots.py  # 维护空档查询：可行开始时刻区间合并、端点相接、孤立时刻、固定 RUNNING 基线、HTTP
   test_idempotency.py  # POST /jobs 幂等：首次/重试/409、失败不占 key、依赖规范化、租户隔离、并发与重启只建一个作业
   test_dependencies_revision.py  # 依赖修订：整体替换/清空、跨租户、QUEUED 限定、拒绝保持原依赖、预演与批次生效、幂等指纹保留
+  test_cancel_cascade.py  # 依赖取消级联：传递闭包、穿过已取消/不穿过已完成、最短依赖链、预览零写入、级联原子取消与 GPU 释放、404/409
   test_api.py          # HTTP 端到端测试
 Dockerfile
 docker-compose.yml
