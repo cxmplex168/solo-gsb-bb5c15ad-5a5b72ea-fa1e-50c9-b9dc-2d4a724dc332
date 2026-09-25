@@ -335,6 +335,37 @@ def cancel_job(job_id: str):
         raise HTTPException(status_code=e.status_code, detail=str(e))
 
 
+@app.get("/jobs/{job_id}/cancel-impact", tags=["jobs"])
+def cancel_impact(job_id: str):
+    """Preview the queued descendants a cancellation would permanently block.
+
+    For a QUEUED or RUNNING job, computes the transitive closure of the
+    cross-tenant dependency graph along dependent edges: CANCELLED nodes are
+    passed through (they can never complete, so their dependents stay
+    doomed), COMPLETED/RUNNING nodes stop the traversal. Returns the
+    still-QUEUED jobs that could never become schedulable again, sorted by
+    job id, each annotated with one shortest dependency chain back to the
+    target. Read-only: nothing is written. Unknown job -> 404;
+    COMPLETED/CANCELLED target -> 409.
+    """
+    return scheduler.cancel_impact(job_id)
+
+
+@app.post("/jobs/{job_id}/cancel-cascade", tags=["jobs"])
+def cancel_cascade(job_id: str):
+    """Cancel a job and every still-QUEUED descendant its cancellation dooms.
+
+    Recomputes the same impact scope as ``GET /jobs/{id}/cancel-impact``
+    inside the shared write lock and a single SQLite transaction (the style
+    used by plain cancel and dependency revision), then cancels the target —
+    releasing its GPUs immediately when RUNNING — and every QUEUED job in
+    scope. Already-CANCELLED intermediate nodes are used for traversal only
+    and are not modified again. Unknown job -> 404; COMPLETED/CANCELLED
+    target -> 409.
+    """
+    return scheduler.cancel_cascade(job_id)
+
+
 @app.post("/jobs/{job_id}/complete", tags=["jobs"])
 def complete_job(job_id: str):
     """Mark a RUNNING job COMPLETED, releasing its GPUs."""

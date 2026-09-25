@@ -127,6 +127,30 @@ to any concurrent batch/preview, and the next preview or committed batch
 already judges the new edges. The job keeps its ``queued_at`` queue
 position and no balance/aging state is touched.
 
+Cancel impact preview & cascade cancellation
+============================================
+``cancel_impact`` (``GET /jobs/{id}/cancel-impact``) answers, for a QUEUED
+or RUNNING job, *which queued descendants would be permanently blocked* if
+the job were cancelled: the transitive closure of the cross-tenant
+dependency graph along dependent edges (prerequisite -> dependent). The
+traversal passes through CANCELLED nodes — they can never complete, so
+their dependents stay doomed too — but never through COMPLETED nodes (a
+completed prerequisite has already released its dependents) or RUNNING ones
+(they may still complete). Every reached QUEUED job is reported with one
+shortest dependency chain back to the target (BFS with id-ordered
+neighbours, so the choice is deterministic), and the list is sorted by job
+id. The preview is read-only: nothing is written.
+
+``cancel_cascade`` (``POST /jobs/{id}/cancel-cascade``) performs the
+cancellation: under the same process-wide lock and ``BEGIN IMMEDIATE``
+write-transaction style as a plain cancel or a dependency revision, it
+recomputes the impact (so the decision and the writes are atomic), cancels
+the target — releasing its GPUs immediately when it was RUNNING — and
+cancels every still-QUEUED job in the computed scope. Already-CANCELLED
+intermediate nodes are traversal-only and are never re-modified. Tenants
+whose queues drain get their aging clock reset exactly as with a plain
+cancel. An unknown target gets 404; a COMPLETED or CANCELLED one gets 409.
+
 Idempotent submission
 =====================
 ``POST /jobs`` accepts an optional ``Idempotency-Key`` request header. A
@@ -1029,6 +1053,154 @@ def revise_dependencies(
                 (job_id, prereq),
             )
         return _get_job_or_404(conn, job_id)
+
+
+# ---------------------------------------------------------------------------
+# Cancel impact preview & cascade cancellation
+# ---------------------------------------------------------------------------
+
+def _cancel_impact_closure(
+    conn: sqlite3.Connection, target_id: str
+) -> dict[str, list[str]]:
+    """QUEUED descendants permanently blocked once ``target_id`` is cancelled.
+
+    Breadth-first traversal of the dependent edges (prerequisite ->
+    dependent) starting at the target. CANCELLED nodes are passed through —
+    they can never complete, so their dependents stay doomed too — but are
+    not themselves reported; COMPLETED and RUNNING nodes stop the traversal
+    (a completed prerequisite has already released its dependents, a running
+    one may still complete). Returns a map of affected QUEUED job id to one
+    shortest dependency chain from the target (job ids, target first,
+    affected job last); BFS with id-ordered neighbours makes the chain
+    choice deterministic.
+    """
+    affected: dict[str, list[str]] = {}
+    visited = {target_id}
+    frontier: list[tuple[str, list[str]]] = [(target_id, [target_id])]
+    while frontier:
+        node, chain = frontier.pop(0)
+        rows = conn.execute(
+            """SELECT j.id AS id, j.status AS status
+                 FROM job_dependencies d
+                 JOIN jobs j ON j.id = d.job_id
+                WHERE d.depends_on = ?
+                ORDER BY j.id""",
+            (node,),
+        ).fetchall()
+        for r in rows:
+            jid = r["id"]
+            if jid in visited:
+                continue
+            visited.add(jid)
+            if r["status"] in (COMPLETED, RUNNING):
+                continue  # traversal stops: this branch is not doomed
+            child_chain = chain + [jid]
+            if r["status"] == QUEUED:
+                affected[jid] = child_chain
+            # QUEUED and CANCELLED nodes are both traversed through.
+            frontier.append((jid, child_chain))
+    return affected
+
+
+def _impact_job_dicts(
+    conn: sqlite3.Connection, closure: dict[str, list[str]]
+) -> list[dict[str, Any]]:
+    """Full job objects for an impact closure, id-sorted, each with its chain."""
+    jobs = []
+    for jid in sorted(closure):
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (jid,)
+        ).fetchone()
+        jobs.append(_job_dict(conn, row) | {"chain": closure[jid]})
+    return jobs
+
+
+def _cancel_target_or_404(conn: sqlite3.Connection, job_id: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None:
+        raise NotFound(f"job '{job_id}' not found")
+    if row["status"] in (COMPLETED, CANCELLED):
+        raise Conflict(
+            f"job '{job_id}' is already {row['status'].lower()}"
+        )
+    return row
+
+
+def cancel_impact(job_id: str) -> dict[str, Any]:
+    """Read-only preview of :func:`cancel_cascade` (no writes at all).
+
+    For a QUEUED or RUNNING target, returns the still-QUEUED descendant jobs
+    that its cancellation would permanently block — the transitive closure
+    over the cross-tenant dependency graph, traversing through CANCELLED
+    nodes but never through COMPLETED (or RUNNING) ones — sorted by job id,
+    each annotated with one shortest dependency chain back to the target.
+    """
+    with db.get_lock():
+        conn = db.get_conn()
+        row = _cancel_target_or_404(conn, job_id)
+        affected_jobs = _impact_job_dicts(
+            conn, _cancel_impact_closure(conn, row["id"])
+        )
+        return {
+            "job_id": row["id"],
+            "status": row["status"],
+            "affected_count": len(affected_jobs),
+            "affected_jobs": affected_jobs,
+        }
+
+
+def cancel_cascade(job_id: str) -> dict[str, Any]:
+    """Cancel a job and every still-QUEUED descendant its cancellation dooms.
+
+    The impact scope is recomputed inside the same process-wide lock and
+    ``BEGIN IMMEDIATE`` write transaction used by a plain cancel and by
+    dependency revisions, so the decision and the mutations are atomic with
+    respect to any concurrent batch/preview/cancel. The target is cancelled
+    (a RUNNING target releases its GPUs immediately) together with every
+    QUEUED job in scope; already-CANCELLED intermediate nodes only guide the
+    traversal and are never re-modified. Tenants whose queues drain get
+    their aging clock reset exactly as with a plain cancel.
+    """
+    now = _now_iso()
+    with db.get_lock(), db.get_conn():
+        conn = db.get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        row = _cancel_target_or_404(conn, job_id)
+        # GPUs a RUNNING target frees for subsequent batches (0 when QUEUED).
+        released = int(row["gpus"]) if row["status"] == RUNNING else 0
+
+        closure = _cancel_impact_closure(conn, job_id)
+        tenants_touched = {row["tenant_id"]}
+        conn.execute(
+            "UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?",
+            (CANCELLED, now, job_id),
+        )
+        for jid in sorted(closure):
+            tenant_id = conn.execute(
+                "SELECT tenant_id FROM jobs WHERE id = ?", (jid,)
+            ).fetchone()["tenant_id"]
+            tenants_touched.add(tenant_id)
+            conn.execute(
+                "UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?",
+                (CANCELLED, now, jid),
+            )
+        # Same drained-queue aging-clock reset as a plain cancel.
+        for tenant_id in tenants_touched:
+            if not _has_queued(conn, tenant_id):
+                conn.execute(
+                    "UPDATE tenants SET aging_settled_at = NULL WHERE id = ?",
+                    (tenant_id,),
+                )
+        affected_jobs = _impact_job_dicts(conn, closure)
+        return {
+            "job_id": job_id,
+            "status": CANCELLED,
+            "released_gpus": released,
+            "affected_count": len(affected_jobs),
+            "affected_jobs": affected_jobs,
+            "cancelled_count": 1 + len(affected_jobs),
+            "cancelled_job_ids": sorted([job_id, *closure]),
+        }
 
 
 # ---------------------------------------------------------------------------
